@@ -70,12 +70,25 @@ sau khi transaction commit thành công*:
 ## Kiến trúc
 
 <p align="center">
-  <img src="docs/architecture.png" alt="Kiến trúc AWS" width="820">
+  <a href="docs/architecture.png">
+    <img src="docs/architecture.png" alt="Kiến trúc AWS" width="100%">
+  </a>
 </p>
 
-Ba tầng subnet trên 2 AZ. Tầng data chỉ có route `local` — không gắn IGW cũng
-không gắn NAT, nên RDS và EFS không có đường ra internet. Điều phân biệt tầng
-`private` với tầng `data` là **route table**, không phải cái tên.
+<p align="center"><sub>Bấm vào ảnh để xem cỡ đầy đủ (2140 px)</sub></p>
+
+Sơ đồ vẽ đúng theo `deploy/terraform/` — mọi thành phần trên hình đều có resource
+tương ứng trong code.
+
+Ba tầng subnet trên 2 AZ. Điều phân biệt tầng `private` với tầng `data` là
+**route table**, không phải cái tên: tầng `data` chỉ có route `local`, không gắn
+IGW cũng không gắn NAT, nên RDS và EFS mount target không có đường ra internet.
+Chỉ có **một NAT Gateway** đặt ở AZ 1a — cả hai private subnet đều đi qua nó, đây
+là đánh đổi chi phí đã ghi trong `docs/ban-giao/lua-chon-thiet-ke.md`.
+
+Hai đường migration chạy song song: **DMS** `full-load + CDC` kéo dữ liệu từ
+PostgreSQL on-premise sang RDS, và **DataSync** đồng bộ file từ bucket staging
+sang EFS. Cả hai đều chạy trong data subnet.
 
 Sơ đồ có ba dạng, sinh từ cùng một bản mô tả toạ độ trong
 [`docs/architecture_gen.py`](docs/architecture_gen.py):

@@ -77,14 +77,18 @@ Ba tầng subnet trên 2 AZ. Tầng data chỉ có route `local` — không gắ
 không gắn NAT, nên RDS và EFS không có đường ra internet. Điều phân biệt tầng
 `private` với tầng `data` là **route table**, không phải cái tên.
 
-Sơ đồ sinh bằng [`docs/architecture.py`](docs/architecture.py) (thư viện
-`diagrams` + graphviz, icon AWS chính thức). Bản sửa tay:
-[`docs/architecture.drawio`](docs/architecture.drawio) — mở bằng
-[draw.io](https://app.diagrams.net). Bản vector: [`docs/architecture.svg`](docs/architecture.svg).
+Sơ đồ có ba dạng, sinh từ cùng một bản mô tả toạ độ trong
+[`docs/architecture_gen.py`](docs/architecture_gen.py):
+
+| File | Dùng khi |
+|---|---|
+| [`architecture.drawio`](docs/architecture.drawio) | Sửa trong [draw.io](https://app.diagrams.net) — dùng shape AWS4 gốc |
+| [`architecture.svg`](docs/architecture.svg) | Bản vector, icon AWS nhúng sẵn |
+| [`architecture.png`](docs/architecture.png) | Bản nhúng trong README này |
 
 ```bash
-pip install diagrams          # cần graphviz trên máy
-python docs/architecture.py   # sinh lại architecture.png và architecture.svg
+pip install diagrams cairosvg   # icon AWS lấy từ package diagrams
+python docs/architecture_gen.py
 ```
 
 Môi trường local dựng đúng hình dạng này, để những gì test được ở đây vẫn còn ý

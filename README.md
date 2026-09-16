@@ -69,43 +69,28 @@ sau khi transaction commit thành công*:
 
 ## Kiến trúc
 
-<p align="center">
-  <a href="docs/architecture.png">
-    <img src="docs/architecture.png" alt="Kiến trúc AWS" width="100%">
-  </a>
-</p>
+Sơ đồ đầy đủ: **[`docs/architecture.drawio`](docs/architecture.drawio)** — mở bằng
+[app.diagrams.net](https://app.diagrams.net). Dùng bộ AWS Architecture Icons chính thức.
+Mô tả từng luồng và từng quyết định thiết kế: [`docs/architecture.md`](docs/architecture.md).
 
-<p align="center"><sub>Bấm vào ảnh để xem cỡ đầy đủ (2140 px)</sub></p>
+```
+Người dùng → CloudFront ─┬─ S3 · SPA tĩnh (OAC)
+                         └─ /api/* → IGW → ALB :80 → EC2 :8080 ─┬─ DynamoDB · chống đơn trùng
+                                                                ├─ SQS FIFO + DLQ
+                                                                ├─ EFS mount target · NFS 2049
+                                                                └─ RDS Proxy → RDS PostgreSQL 16 Multi-AZ
 
-Sơ đồ vẽ đúng theo `deploy/terraform/` — mọi thành phần trên hình đều có resource
-tương ứng trong code.
-
-Ba tầng subnet trên 2 AZ. Điều phân biệt tầng `private` với tầng `data` là
-**route table**, không phải cái tên: tầng `data` chỉ có route `local`, không gắn
-IGW cũng không gắn NAT, nên RDS và EFS mount target không có đường ra internet.
-Chỉ có **một NAT Gateway** đặt ở AZ 1a — cả hai private subnet đều đi qua nó, đây
-là đánh đổi chi phí đã ghi trong `docs/ban-giao/lua-chon-thiet-ke.md`.
-
-Hai đường migration chạy song song: **DMS** `full-load + CDC` kéo dữ liệu từ
-PostgreSQL on-premise sang RDS, và **DataSync** đồng bộ file từ bucket staging
-sang EFS. Cả hai đều chạy trong data subnet.
-
-Sơ đồ có ba dạng, sinh từ cùng một bản mô tả toạ độ trong
-[`docs/architecture_gen.py`](docs/architecture_gen.py):
-
-| File | Dùng khi |
-|---|---|
-| [`architecture.drawio`](docs/architecture.drawio) | Sửa trong [draw.io](https://app.diagrams.net) — dùng shape AWS4 gốc |
-| [`architecture.svg`](docs/architecture.svg) | Bản vector, icon AWS nhúng sẵn |
-| [`architecture.png`](docs/architecture.png) | Bản nhúng trong README này |
-
-```bash
-pip install diagrams cairosvg   # icon AWS lấy từ package diagrams
-python docs/architecture_gen.py
+On-premise PostgreSQL ──── DMS · full-load + CDC ────────────────→ RDS primary
+On-premise File server ─── S3 staging ── DataSync ───────────────→ EFS file system
 ```
 
-Môi trường local dựng đúng hình dạng này, để những gì test được ở đây vẫn còn ý
-nghĩa khi lên cloud.
+Ba tầng subnet trên 2 AZ. Điều phân biệt tầng `private` với tầng `data` là **route table**,
+không phải cái tên: tầng `data` chỉ có route `local`, không gắn IGW cũng không gắn NAT, nên
+RDS và EFS mount target không có đường ra internet. Chỉ có **một NAT Gateway** ở AZ 1a — cả
+hai private subnet cùng route qua nó, là đánh đổi chi phí có chủ ý.
+
+Môi trường local dựng đúng hình dạng này, để những gì test được ở đây vẫn còn ý nghĩa khi
+lên cloud.
 
 | Container local | Tương ứng trên AWS |
 |---|---|
@@ -116,9 +101,9 @@ nghĩa khi lên cloud.
 | `db-replica` | RDS read replica — chỉ phục vụ job báo cáo |
 | `queue-db` | SQS FIFO (`orders.fifo`) + DynamoDB accept store |
 
-`queue-db` **phải** là container riêng: trên AWS, SQS và DynamoDB độc lập hoàn
-toàn với RDS. Nếu ở local để hàng đợi nằm chung database với bảng `orders` thì
-khi chặn RDS để test outage, hàng đợi cũng chết theo và kịch bản mất hết ý nghĩa.
+`queue-db` **phải** là container riêng: trên AWS, SQS và DynamoDB độc lập hoàn toàn với RDS.
+Nếu ở local để hàng đợi nằm chung database với bảng `orders` thì khi chặn RDS để test outage,
+hàng đợi cũng chết theo và kịch bản mất hết ý nghĩa.
 
 Chuyển sang dịch vụ AWS thật chỉ là đổi biến môi trường, không đổi code:
 

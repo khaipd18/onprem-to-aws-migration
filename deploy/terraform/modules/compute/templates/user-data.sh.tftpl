@@ -1,0 +1,96 @@
+#!/bin/bash
+set -eux
+
+REGION=${region}
+PREFIX=${name_prefix}
+TIER=${tier}
+BUCKET=${artifact_bucket}
+
+dnf install -y python3.12 python3.12-pip amazon-cloudwatch-agent
+
+VERSION=$(aws s3 cp s3://$BUCKET/current.txt - --region $REGION)
+aws s3 cp s3://$BUCKET/app-$VERSION.tar.gz /tmp/app.tar.gz --region $REGION
+mkdir -p /opt/abc
+tar xzf /tmp/app.tar.gz -C /opt/abc --strip-components=1
+python3.12 -m venv /opt/abc/.venv
+/opt/abc/.venv/bin/pip install --no-cache-dir -r /opt/abc/requirements.txt
+
+TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token \
+  -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+IID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/instance-id)
+
+get() {
+  aws ssm get-parameter --region $REGION --name "/$PREFIX/$1" \
+    --with-decryption --query Parameter.Value --output text
+}
+
+cat >/etc/abc.env <<EOF
+TIER=$TIER
+APP_ENV=aws
+AWS_REGION=$REGION
+INSTANCE_ID=$IID
+DB_HOST=$(get db/host)
+DB_PORT=$(get db/port)
+DB_NAME=$(get db/name)
+DB_USER=$(get db/user)
+DB_PASSWORD=$(get db/password)
+DB_SSLMODE=require
+QUEUE_DRIVER=sqs
+SQS_QUEUE_URL=${queue_url}
+SQS_DLQ_URL=${dlq_url}
+VISIBILITY_TIMEOUT=${visibility_timeout_seconds}
+MAX_RECEIVE_COUNT=${max_receive_count}
+ACCEPT_STORE_DRIVER=${accept_store_driver}
+DDB_ACCEPT_TABLE=${accept_store_name}
+ALLOWED_ORIGINS=${allowed_origins}
+WORKER_BATCH=10
+EOF
+chmod 600 /etc/abc.env
+
+CMD="/opt/abc/.venv/bin/uvicorn appapi.main:app --host 0.0.0.0 --port ${app_port}"
+
+unit() {   # unit <ten> <mo ta> <lenh> <tier>
+  cat >/etc/systemd/system/$1.service <<EOF
+[Unit]
+Description=$2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/abc
+EnvironmentFile=/etc/abc.env
+Environment=TIER=$4
+ExecStart=$3
+Restart=always
+RestartSec=3
+User=ec2-user
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+unit abc "ABC Sales $TIER" "$CMD" "$TIER"
+
+# Worker chay chung instance voi App tier thay vi mot nhom rieng: bot mot may
+# phai tra tien, doi lai suc chua cua worker gan voi suc chua cua App tier.
+# O luu luong nay danh doi do chap nhan duoc. Van la mot tien trinh rieng, mot
+# unit rieng, nen ALB health check cua App tier khong bi worker keo theo.
+if [ "$TIER" = "app" ] && [ "${colocate_worker}" = "true" ]; then
+  unit abc-worker "ABC Sales worker" \
+    "/opt/abc/.venv/bin/python -u worker/main.py" "worker"
+fi
+
+systemctl daemon-reload
+systemctl enable --now abc
+[ -f /etc/systemd/system/abc-worker.service ] && systemctl enable --now abc-worker
+
+cat >/opt/aws/amazon-cloudwatch-agent/etc/abc.json <<EOF
+{"logs":{"logs_collected":{"files":{"collect_list":[
+  {"file_path":"/var/log/messages",
+   "log_group_name":"/$PREFIX/$TIER",
+   "log_stream_name":"{instance_id}"}]}}}}
+EOF
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/abc.json

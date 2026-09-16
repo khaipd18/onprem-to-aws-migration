@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ABC Manufacturing — Đặt hàng B2B</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --surface:#fff; --border:#dfe3e8; --text:#1b1f24;
+    --muted:#5c6672; --accent:#0b6bcb; --ok:#1a7f4b; --warn:#9a6700; --err:#b42318;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{--bg:#14171a;--surface:#1c2024;--border:#2c3238;--text:#e6e9ec;
+          --muted:#98a2ad;--accent:#5aa9f5;--ok:#4ec98a;--warn:#e0b341;--err:#f27c72;}
+  }
+  *{box-sizing:border-box}
+  .thumb{width:56px;height:42px;object-fit:cover;border-radius:4px;
+         border:1px solid var(--border);background:var(--bg);flex:none}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{background:var(--surface);border-bottom:1px solid var(--border);
+         padding:14px 20px;display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+  h1{font-size:16px;margin:0;font-weight:650}
+  .sub{color:var(--muted);font-size:12px}
+  main{max-width:1100px;margin:0 auto;padding:20px;display:grid;
+       grid-template-columns:minmax(300px,380px) 1fr;gap:20px;align-items:start}
+  @media (max-width:820px){main{grid-template-columns:1fr}}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px}
+  .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.04em;
+           color:var(--muted);margin:0 0 12px}
+  label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
+  select,input,button{font:inherit;padding:7px 9px;border:1px solid var(--border);
+         border-radius:6px;background:var(--bg);color:var(--text);width:100%}
+  button{background:var(--accent);color:#fff;border-color:transparent;cursor:pointer;
+         font-weight:600;margin-top:14px}
+  button:disabled{opacity:.55;cursor:not-allowed}
+  button.ghost{background:transparent;color:var(--accent);border-color:var(--border);margin-top:8px}
+  .row{display:grid;grid-template-columns:1fr 90px auto;gap:8px;align-items:end;margin-bottom:6px}
+  .row button{margin:0;background:transparent;color:var(--err);border-color:var(--border);width:auto;padding:7px 10px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.04em;
+     color:var(--muted);font-weight:600;padding:6px 8px;border-bottom:1px solid var(--border)}
+  td{padding:7px 8px;border-bottom:1px solid var(--border);vertical-align:top}
+  tbody tr:last-child td{border-bottom:0}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+  .badge{display:inline-block;padding:1px 7px;border-radius:99px;font-size:11px;font-weight:650}
+  .b-CONFIRMED{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+  .b-PENDING{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
+  .b-FAILED,.b-UNKNOWN{background:color-mix(in srgb,var(--err) 16%,transparent);color:var(--err)}
+  .b-CANCELLED{background:color-mix(in srgb,var(--muted) 18%,transparent);color:var(--muted)}
+  #log{margin-top:12px;font-size:12px;max-height:190px;overflow:auto}
+  #log div{padding:4px 0;border-bottom:1px solid var(--border);color:var(--muted)}
+  #log .e{color:var(--err)} #log .s{color:var(--ok)}
+  .hint{font-size:12px;color:var(--muted);margin-top:10px;line-height:1.5}
+</style>
+</head>
+<body>
+<header>
+  <h1>ABC Manufacturing — Đặt hàng B2B</h1>
+  <span class="sub" id="tierinfo">đang tải…</span>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Tạo đơn hàng</h2>
+    <label for="cust">Khách hàng</label>
+    <select id="cust"></select>
+
+    <label>Dòng hàng</label>
+    <div id="items"></div>
+    <button class="ghost" id="addrow" type="button">+ Thêm dòng</button>
+
+    <button id="submit" type="button">Gửi đơn</button>
+    <button class="ghost" id="double" type="button">Gửi 2 lần cùng Idempotency-Key</button>
+
+    <p class="hint">
+      API trả <code>202 Accepted</code> + trạng thái <code>PENDING</code>, chưa phải
+      "thành công". Trang này tự poll cho tới khi đơn chuyển
+      <code>CONFIRMED</code>.
+    </p>
+    <div id="log"></div>
+  </section>
+
+  <section class="card">
+    <h2>Đơn gần đây</h2>
+    <table>
+      <thead><tr><th>Mã đơn</th><th>Khách</th><th>Trạng thái</th>
+                 <th>Giá trị</th><th>Ver</th><th></th></tr></thead>
+      <tbody id="orders"><tr><td colspan="6" style="color:var(--muted)">đang tải…</td></tr></tbody>
+    </table>
+    <button class="ghost" id="refresh" type="button">Làm mới</button>
+  </section>
+</main>
+
+<script>
+const api = (p, o) => fetch('/api' + p, o);
+const log = (m, cls='') => {
+  const el = document.getElementById('log');
+  const d = document.createElement('div');
+  d.className = cls;
+  d.textContent = new Date().toLocaleTimeString('vi-VN') + '  ' + m;
+  el.prepend(d);
+};
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID()
+  : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+      const r = Math.random()*16|0; return (c==='x'?r:(r&0x3|0x8)).toString(16); }));
+const money = n => Number(n||0).toLocaleString('vi-VN') + ' ₫';
+
+let PRODUCTS = [], CUSTOMERS = [];
+
+// Rỗng => ảnh do Web tier phục vụ từ đĩa (local, hoặc khi chưa dựng CloudFront).
+// Có giá trị => trỏ thẳng sang CloudFront, ảnh không đi qua Web tier.
+const imageUrl = sku => `/static/products/${sku}.png`;
+
+// ---------------------------------------------------------------------------
+// Idempotency-Key phải SỐNG QUA reload trang.
+//
+// Trước đây mỗi lần bấm "Tạo đơn" sinh một uuid mới. Nghĩa là bấm hai lần, hoặc
+// bấm rồi F5 rồi bấm lại, sẽ ra hai key khác nhau và tạo hai đơn — đúng thứ
+// ràng buộc #3 cấm. Tuyến phòng thủ ở App tier và UNIQUE constraint trong DB
+// chỉ chặn được khi key GIỐNG NHAU.
+//
+// Nên khoá được giữ trong localStorage cho tới khi đơn thực sự được ghi nhận:
+//   bắt đầu điền đơn  -> sinh khoá, lưu lại
+//   bấm gửi nhiều lần -> vẫn dùng đúng khoá đó
+//   F5 giữa chừng     -> đọc lại khoá cũ
+//   đơn đã nhận       -> xoá khoá, đơn sau dùng khoá mới
+// ---------------------------------------------------------------------------
+const DRAFT_KEY = 'abc.order.draftKey';
+
+function draftKey(){
+  let k = null;
+  try { k = localStorage.getItem(DRAFT_KEY); } catch (e) { /* chế độ riêng tư */ }
+  if (!k) {
+    k = uuid();
+    try { localStorage.setItem(DRAFT_KEY, k); } catch (e) { /* bỏ qua */ }
+  }
+  return k;
+}
+
+function clearDraftKey(){
+  try { localStorage.removeItem(DRAFT_KEY); } catch (e) { /* bỏ qua */ }
+}
+
+function addRow(){
+  const wrap = document.getElementById('items');
+  const div = document.createElement('div');
+  div.className = 'row';
+  const first = PRODUCTS[0] ? PRODUCTS[0].sku : '';
+  div.innerHTML = `<div style="display:flex;gap:8px;align-items:center">
+      <img class="thumb" alt="" loading="lazy" src="${first ? imageUrl(first) : ''}">
+      <select class="sku">${
+        PRODUCTS.map(p => `<option value="${p.sku}">${p.sku} — ${p.name}</option>`).join('')
+      }</select></div>
+    <div><input class="qty" type="number" min="1" value="1"></div>
+    <button type="button">✕</button>`;
+  const sel = div.querySelector('.sku'), img = div.querySelector('.thumb');
+  sel.onchange = () => { img.src = imageUrl(sel.value); };
+  div.querySelector('button').onclick = () => div.remove();
+  wrap.appendChild(div);
+}
+
+function payload(){
+  const items = [...document.querySelectorAll('#items .row')].map(r => ({
+    sku: r.querySelector('.sku').value,
+    quantity: parseInt(r.querySelector('.qty').value || '1', 10)
+  }));
+  return { customer_code: document.getElementById('cust').value, items };
+}
+
+async function submitOrder(key, clearAfter = false){
+  const body = payload();
+  if (!body.items.length) { log('Đơn phải có ít nhất 1 dòng hàng', 'e'); return; }
+  const res = await api('/orders', {
+    method:'POST',
+    headers:{'Content-Type':'application/json','Idempotency-Key':key},
+    body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  if (!res.ok) { log(`HTTP ${res.status} — ${data.message || data.error}`, 'e'); return; }
+  log(`HTTP ${res.status} · order ${data.order_id.slice(0,8)} · ${data.status}`
+      + (data.deduplicated ? ' · TRÙNG, không tạo đơn mới' : ''),
+      data.deduplicated ? '' : 's');
+  // Đơn đã được tiếp nhận, khoá này đã dùng xong. Đơn tiếp theo dùng khoá mới.
+  if (clearAfter) clearDraftKey();
+  poll(data.order_id);
+}
+
+async function poll(id, tries=0){
+  if (tries > 40) { log(`Đơn ${id.slice(0,8)} vẫn PENDING sau 40 lần poll`, 'e'); return; }
+  const res = await api('/orders/' + id);
+  if (res.status === 503) {
+    log(`Đơn ${id.slice(0,8)} — chưa xác nhận được (DB không sẵn sàng), poll tiếp…`);
+    setTimeout(() => poll(id, tries+1), 2000); return;
+  }
+  const o = await res.json();
+  if (o.status === 'CONFIRMED') { log(`Đơn ${id.slice(0,8)} → CONFIRMED`, 's'); loadOrders(); return; }
+  if (o.status === 'FAILED')    { log(`Đơn ${id.slice(0,8)} → FAILED`, 'e'); loadOrders(); return; }
+  setTimeout(() => poll(id, tries+1), 1000);
+}
+
+async function loadOrders(){
+  const tbody = document.getElementById('orders');
+  try {
+    const res = await api('/orders?limit=25');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const { orders } = await res.json();
+    tbody.innerHTML = orders.length ? orders.map(o => `
+      <tr>
+        <td><code>${o.order_no || o.id.slice(0,8)}</code></td>
+        <td>${o.customer_code}</td>
+        <td><span class="badge b-${o.status}">${o.status}</span></td>
+        <td>${money(o.total_amount)}</td>
+        <td>${o.version}</td>
+        <td><button class="ghost" style="margin:0;padding:3px 8px;width:auto"
+             onclick="cancelOrder('${o.id}',${o.version})">Huỷ</button></td>
+      </tr>`).join('')
+      : '<tr><td colspan="6" style="color:var(--muted)">chưa có đơn nào</td></tr>';
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="6" class="b-FAILED">không tải được: ${e.message}</td></tr>`;
+  }
+}
+
+async function cancelOrder(id, version){
+  const res = await api('/orders/' + id, {
+    method:'PUT', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ version, status:'CANCELLED' })
+  });
+  const d = await res.json();
+  if (res.status === 409) log(`409 Conflict — ${d.message}`, 'e');
+  else if (res.ok)        log(`Đã huỷ ${id.slice(0,8)} · version → ${d.version}`, 's');
+  else                    log(`HTTP ${res.status} — ${d.message||d.error}`, 'e');
+  loadOrders();
+}
+window.cancelOrder = cancelOrder;
+
+async function boot(){
+  try {
+    const info = await (await api('/ops/info')).json();
+    document.getElementById('tierinfo').textContent =
+      `${info.env} · app=${info.instance} · queue=${info.queue_driver}` +
+      (info.legacy_mode ? ' · LEGACY (ghi thẳng DB)' : '') +
+      (info.replica ? ' · có read replica' : '');
+  } catch { document.getElementById('tierinfo').textContent = 'không gọi được App tier'; }
+
+  const [cs, ps] = await Promise.all([
+    (await api('/ops/customers')).json(), (await api('/ops/products')).json()
+  ]);
+  CUSTOMERS = cs.customers; PRODUCTS = ps.products;
+  document.getElementById('cust').innerHTML =
+    CUSTOMERS.map(c => `<option value="${c.code}">${c.code} — ${c.name} (${c.branch})</option>`).join('');
+  addRow();
+  loadOrders();
+}
+
+document.getElementById('addrow').onclick = addRow;
+document.getElementById('refresh').onclick = loadOrders;
+document.getElementById('submit').onclick = () => submitOrder(draftKey(), true);
+
+// Nút kiểm chứng ràng buộc #3: gửi hai request cùng khoá, phải ra đúng một đơn.
+document.getElementById('double').onclick = async () => {
+  const key = draftKey();
+  log('Gửi 2 request cùng Idempotency-Key ' + key.slice(0,8) + '…');
+  await submitOrder(key);
+  await submitOrder(key, true);
+};
+boot();
+</script>
+</body>
+</html>

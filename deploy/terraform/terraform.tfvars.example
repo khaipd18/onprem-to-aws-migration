@@ -1,0 +1,12 @@
+aws_profile = "abc-migration"
+aws_region  = "ap-southeast-1"
+
+project     = "abc-migration"
+environment = "dev"
+
+owner = "khaipd18"
+
+extra_tags = {
+  CostCenter = "lab"
+  Purpose    = "migration-demo"
+}

@@ -1,0 +1,260 @@
+# ---------------------------------------------------------------------------
+# Môi trường LOCAL mô phỏng topology sẽ dựng trên AWS.
+#
+#   ánh xạ sang AWS
+#   -----------------------------------------------------------------------
+#   web        -> ASG Web tier   (private app subnet, sau ALB public)
+#   app        -> ASG App tier   (private app subnet, sau ALB internal)
+#   worker     -> process riêng cùng ASG App tier
+#   db         -> RDS PostgreSQL Multi-AZ (truy cập qua RDS Proxy)
+#   db-replica -> RDS read replica  (chỉ dành cho job báo cáo)
+#   queue-db   -> SQS FIFO + DynamoDB accept store
+#
+#   profile "onprem" -> hệ thống nguồn cần migrate (2 server + file server)
+#
+# Chạy:
+#   docker compose -f deploy/local/docker-compose.yml up -d --build
+#   docker compose -f deploy/local/docker-compose.yml --profile onprem up -d
+# ---------------------------------------------------------------------------
+name: abc-sales
+
+x-app-env: &app-env
+  APP_ENV: local
+  DB_HOST: db
+  DB_PORT: 5432
+  DB_NAME: abcsales
+  DB_USER: abcapp
+  DB_PASSWORD: abcapp
+  DB_REPLICA_HOST: db-replica
+  DB_REPLICA_PORT: 5432
+  QUEUE_DRIVER: pg
+  QUEUE_DB_HOST: queue-db
+  QUEUE_DB_NAME: abcqueue
+  ACCEPT_STORE_DRIVER: pg
+  VISIBILITY_TIMEOUT: 30        # local để ngắn cho dễ quan sát; AWS dùng 180
+  MAX_RECEIVE_COUNT: 5
+
+services:
+  # ---------------------------------------------------------------- database
+  db:
+    image: postgres:16-alpine
+    container_name: abc-db
+    environment:
+      POSTGRES_DB: abcsales
+      POSTGRES_USER: abcapp
+      POSTGRES_PASSWORD: abcapp
+      POSTGRES_HOST_AUTH_METHOD: trust      # LOCAL ONLY
+    # wal_level=logical là điều kiện để DMS CDC hoạt động, bật sẵn cho khớp
+    # với parameter group sẽ dùng trên RDS.
+    command: >
+      postgres -c wal_level=logical -c max_replication_slots=10
+               -c max_wal_senders=10 -c hot_standby=on
+               -c log_min_duration_statement=500
+    volumes:
+      - ../../deploy/local/initdb/00-replication.sh:/docker-entrypoint-initdb.d/00-replication.sh:ro
+      - ../../db/01-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - db-data:/var/lib/postgresql/data
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U abcapp -d abcsales"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Read replica — ràng buộc #10: job báo cáo chạy ở đây để không đụng OLTP.
+  db-replica:
+    image: postgres:16-alpine
+    container_name: abc-db-replica
+    user: postgres
+    depends_on:
+      db: {condition: service_healthy}
+    environment:
+      PGUSER: abcapp
+      PRIMARY_HOST: db
+    entrypoint: ["/usr/local/bin/replica-entrypoint.sh"]
+    volumes:
+      - ../../deploy/local/replica-entrypoint.sh:/usr/local/bin/replica-entrypoint.sh:ro
+      - replica-data:/var/lib/postgresql/data
+    ports: ["5433:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U abcapp -d abcsales"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Đứng ở vị trí của SQS + DynamoDB: PHẢI tách khỏi db, nếu không thì test B4
+  # (chặn kết nối tới db) cũng sẽ giết luôn hàng đợi và mất hết ý nghĩa.
+  queue-db:
+    image: postgres:16-alpine
+    container_name: abc-queue-db
+    environment:
+      POSTGRES_DB: abcqueue
+      POSTGRES_USER: abcapp
+      POSTGRES_PASSWORD: abcapp
+      POSTGRES_HOST_AUTH_METHOD: trust      # LOCAL ONLY
+    volumes:
+      - ../../db/02-queue-schema.sql:/docker-entrypoint-initdb.d/02-queue-schema.sql:ro
+      - queue-data:/var/lib/postgresql/data
+    ports: ["5434:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U abcapp -d abcqueue"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ----------------------------------------------------------------- app tier
+  app:
+    build: ../../app
+    image: abc-sales-app:local
+    environment:
+      <<: *app-env
+      TIER: app
+    depends_on:
+      db: {condition: service_healthy}
+      queue-db: {condition: service_healthy}
+    command: uvicorn appapi.main:app --host 0.0.0.0 --port 8080
+    ports: ["8081:8080"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 10s          # khớp HealthCheckIntervalSeconds của ALB
+      timeout: 5s
+      retries: 2             # khớp UnhealthyThresholdCount -> phát hiện ~20s
+      start_period: 20s
+
+  worker:
+    build: ../../app
+    image: abc-sales-app:local
+    environment:
+      <<: *app-env
+      TIER: worker
+      WORKER_BATCH: 10
+    depends_on:
+      queue-db: {condition: service_healthy}
+    command: python -u worker/main.py
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------- web tier
+  web:
+    build: ../../app
+    image: abc-sales-app:local
+    environment:
+      TIER: web
+      APP_ENV: local
+      APP_TIER_URL: http://app:8080
+    depends_on:
+      app: {condition: service_started}
+    command: uvicorn web.main:app --host 0.0.0.0 --port 8080
+    ports: ["8080:8080"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 2
+      start_period: 20s
+
+  # ------------------------------------------------------- công cụ một lần
+  # Chạy trong container để không phải cài psycopg lên máy host.
+  #   docker compose -f deploy/local/docker-compose.yml run --rm tools \
+  #       python /work/db/seed.py --orders 5000
+  tools:
+    profiles: ["tools"]
+    build: ../../app
+    image: abc-sales-app:local
+    environment:
+      <<: *app-env
+      TIER: job
+    volumes:
+      - ../../db:/work/db:ro
+      - ../../scripts:/work/scripts:ro
+    working_dir: /work
+    entrypoint: ["python"]
+    command: ["-c", "print('dùng: run --rm tools /work/db/seed.py --orders 5000')"]
+
+  # ================= hệ thống NGUỒN cần migrate (profile: onprem) ============
+  onprem-db:
+    profiles: ["onprem"]
+    image: postgres:16-alpine
+    container_name: abc-onprem-db
+    environment:
+      POSTGRES_DB: abcsales
+      POSTGRES_USER: abcapp
+      POSTGRES_PASSWORD: abcapp
+      POSTGRES_HOST_AUTH_METHOD: trust
+    # wal_level=logical + replication slot: điều kiện bắt buộc phía source để
+    # DMS chạy được Full load + CDC (ràng buộc #2).
+    command: >
+      postgres -c wal_level=logical -c max_replication_slots=10
+               -c max_wal_senders=10
+    volumes:
+      - ../../deploy/local/initdb/00-replication.sh:/docker-entrypoint-initdb.d/00-replication.sh:ro
+      - ../../db/01-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - onprem-db-data:/var/lib/postgresql/data
+    ports: ["15432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U abcapp -d abcsales"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # App monolith on-prem: ghi thẳng vào DB, đồng bộ, không hàng đợi.
+  # Giữ nguyên hành vi cũ để demo được sự khác biệt trước/sau migration.
+  onprem-app:
+    profiles: ["onprem"]
+    build: ../../app
+    image: abc-sales-app:local
+    container_name: abc-onprem-app
+    environment:
+      TIER: app
+      APP_ENV: onprem
+      LEGACY_MODE: "true"
+      DB_HOST: onprem-db
+      DB_NAME: abcsales
+      DB_USER: abcapp
+      DB_PASSWORD: abcapp
+      QUEUE_DRIVER: pg
+      QUEUE_DB_HOST: onprem-db      # legacy không dùng queue, chỉ để config hợp lệ
+      QUEUE_DB_NAME: abcsales
+    depends_on:
+      onprem-db: {condition: service_healthy}
+    command: uvicorn appapi.main:app --host 0.0.0.0 --port 8080
+    ports: ["18081:8080"]
+
+  onprem-web:
+    profiles: ["onprem"]
+    build: ../../app
+    image: abc-sales-app:local
+    container_name: abc-onprem-web
+    environment:
+      TIER: web
+      APP_ENV: onprem
+      APP_TIER_URL: http://onprem-app:8080
+    depends_on:
+      onprem-app: {condition: service_started}
+    command: uvicorn web.main:app --host 0.0.0.0 --port 8080
+    ports: ["18080:8080"]
+
+  # File Server on-prem — Linux, phân quyền POSIX theo phòng ban.
+  # Là source cho AWS DataSync -> EFS (ràng buộc #7).
+  #
+  # Không dùng NFS server thật vì kernel WSL2 không nạp được module nfsd nếu
+  # không có quyền root trên host. Thứ ràng buộc #7 cần chứng minh là QUYỀN
+  # giữ được qua chuyển đổi, không phải giao thức truyền — nên container này
+  # dựng user/group/mode thật rồi giữ chạy để kiểm tra truy cập chéo phòng ban.
+  # Muốn export NFS thật: chạy `sudo modprobe nfsd` trên host rồi đổi image.
+  onprem-files:
+    profiles: ["onprem"]
+    image: debian:12-slim
+    container_name: abc-onprem-files
+    environment:
+      TZ: Asia/Ho_Chi_Minh
+      OWNER_UID: "${OWNER_UID:-1000}"
+    entrypoint: ["/usr/local/bin/fileserver-entrypoint.sh"]
+    volumes:
+      - ./fileserver-entrypoint.sh:/usr/local/bin/fileserver-entrypoint.sh:ro
+      - ../../onprem/fileshare:/share
+
+volumes:
+  db-data:
+  replica-data:
+  queue-data:
+  onprem-db-data:

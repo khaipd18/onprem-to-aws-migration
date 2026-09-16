@@ -69,30 +69,26 @@ sau khi transaction commit thành công*:
 
 ## Kiến trúc
 
-Môi trường local dựng đúng hình dạng sẽ có trên AWS, để những gì test được ở đây
-vẫn còn ý nghĩa khi lên cloud.
+<p align="center">
+  <img src="docs/architecture.png" alt="Kiến trúc AWS" width="820">
+</p>
 
-```
-                     Người dùng
-                          │ HTTPS
-                          ▼
-                    CloudFront  ──── S3 (SPA tĩnh)
-                          │ /api/*
-                          ▼
-                    ALB public
-                          ▼
-              EC2 App tier 2–6 máy + warm pool
-                 │         │          │
-                 ▼         ▼          ▼
-          RDS Proxy    SQS FIFO    EFS access point
-                 ▼       + DLQ      theo phòng ban
-          RDS Multi-AZ      ▼
-                        Worker ──▶ RDS
+Ba tầng subnet trên 2 AZ. Tầng data chỉ có route `local` — không gắn IGW cũng
+không gắn NAT, nên RDS và EFS không có đường ra internet. Điều phân biệt tầng
+`private` với tầng `data` là **route table**, không phải cái tên.
 
-          DynamoDB accept store — nằm ngoài RDS, đọc được khi RDS chết
+Sơ đồ sinh bằng [`docs/architecture.py`](docs/architecture.py) (thư viện
+`diagrams` + graphviz, icon AWS chính thức). Bản sửa tay:
+[`docs/architecture.drawio`](docs/architecture.drawio) — mở bằng
+[draw.io](https://app.diagrams.net). Bản vector: [`docs/architecture.svg`](docs/architecture.svg).
+
+```bash
+pip install diagrams          # cần graphviz trên máy
+python docs/architecture.py   # sinh lại architecture.png và architecture.svg
 ```
 
-Ba tầng subnet trên 2 AZ. Tầng data không có đường ra internet.
+Môi trường local dựng đúng hình dạng này, để những gì test được ở đây vẫn còn ý
+nghĩa khi lên cloud.
 
 | Container local | Tương ứng trên AWS |
 |---|---|

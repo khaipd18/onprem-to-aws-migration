@@ -1,7 +1,17 @@
 # Kiến trúc AWS — Migration hạ tầng On-premise sang AWS
 
-Sơ đồ: [`architecture.drawio`](architecture.drawio) — mở bằng [app.diagrams.net](https://app.diagrams.net)
-hoặc draw.io Desktop. Dùng bộ **AWS Architecture Icons** chính thức (thư viện `mxgraph.aws4`).
+Sáu sơ đồ, nguồn `.drawio` nằm trong [`diagrams/`](diagrams/), PNG xuất ra nằm trong
+[`img/`](img/). Mở và sửa bằng [app.diagrams.net](https://app.diagrams.net) hoặc draw.io
+Desktop. Dùng bộ **AWS Architecture Icons** chính thức (thư viện `mxgraph.aws4`).
+
+| Sơ đồ | Nội dung |
+|---|---|
+| [`architecture`](diagrams/architecture.drawio) | Kiến trúc ở trạng thái vận hành |
+| [`network`](diagrams/network.drawio) | VPC, subnet, route table, đường ra internet |
+| [`security-groups`](diagrams/security-groups.drawio) | Chuỗi security group và cổng |
+| [`request-flow`](diagrams/request-flow.drawio) | Vòng đời một đơn hàng, kèm nhánh hỏng |
+| [`migration`](diagrams/migration.drawio) | DMS + DataSync và trình tự cutover |
+| [`observability`](diagrams/observability.drawio) | 8 alarm, dashboard, truy vết `correlation_id` |
 
 Mọi thành phần trên sơ đồ đều có resource tương ứng trong [`../deploy/terraform/`](../deploy/terraform/).
 
@@ -96,10 +106,14 @@ mà chỉ tốn tiền ổ đĩa (~0,6 USD/tháng).
 
 ## Sinh lại ảnh
 
-File `.drawio` là nguồn duy nhất. Export bằng draw.io Desktop:
+File `.drawio` trong `diagrams/` là nguồn duy nhất. Export bằng draw.io Desktop, chạy từ
+thư mục gốc của repo:
 
 ```bash
-drawio -x -f png -e -b 10 -o architecture.drawio.png architecture.drawio
+for f in architecture network security-groups request-flow migration observability; do
+  drawio -x -f png -b 24 --width 1900 -o "docs/img/$f.png" "docs/diagrams/$f.drawio"
+done
 ```
 
-Cờ `-e` nhúng XML vào file PNG, nên ảnh xuất ra vẫn mở và sửa lại được trong draw.io.
+Thêm cờ `-e` nếu muốn nhúng XML vào chính file PNG, khi đó ảnh xuất ra vẫn mở và sửa lại
+được trong draw.io — đổi lại là file nặng hơn đáng kể.

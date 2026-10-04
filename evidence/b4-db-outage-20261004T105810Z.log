@@ -1,0 +1,13 @@
+  +000s  HTTP 202  status=PENDING   order=0711961f
+  +010s  HTTP 202  status=PENDING   order=f3a3e3fe
+  +021s  HTTP 202  status=PENDING   order=373f0353
+  +031s  HTTP 202  status=PENDING   order=ee16bfc7
+  +041s  HTTP 202  status=PENDING   order=37c4fa11
+  +051s  HTTP 202  status=PENDING   order=8b78dd6f
+--- 2026-10-04T11:00:02Z B4 ---
+outage_seconds=60 accepted=6 confirmed_during_outage=0
+recovery_seconds=16 drain_seconds_đo_từ_db=13.2 drained=6 duplicates=0
+app_started_at trước=2026-10-04T10:57:28.396249865Z sau=2026-10-04T10:57:28.396249865Z
+worker_started_at trước=2026-10-04T10:57:28.224410759Z sau=2026-10-04T10:57:28.224410759Z
+mã HTTP nhận được trong sự cố:
+      6 202

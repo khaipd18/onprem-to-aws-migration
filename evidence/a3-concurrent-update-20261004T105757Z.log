@@ -1,0 +1,5 @@
+--- 2026-10-04T10:58:00Z A3 ---
+order_1=5a26a130-5018-43d5-b82e-9c9762648d6e version_trước=1  A=200 B=409 trạng_thái_cuối=CANCELLED version_cuối=2
+order_2=d9c79cc5-dbd9-4836-ae53-d6827d6dc53c song_song=10 thành_công=1 conflict=9
+PERSISTED|worker|{"items": 1, "total_amount": "7063900.00"}
+UPDATED|app|{"status": "CANCELLED"}

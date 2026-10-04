@@ -1,0 +1,8 @@
+  lần 1: HTTP 202  order_id=224670dd  deduplicated=False
+  lần 2: HTTP 200  order_id=224670dd  deduplicated=True
+  lần 3: HTTP 200  order_id=224670dd  deduplicated=True
+  lần 4: HTTP 200  order_id=224670dd  deduplicated=True
+  lần 5: HTTP 200  order_id=224670dd  deduplicated=True
+--- 2026-10-04T10:57:57Z A2 ---
+key=79b1d662-5798-4376-b7f2-f45165eb662e distinct_ids=1 rows_in_orders=1 accept_rows=1
+224670dd-4d77-4af0-9d01-56a78337c440|SO-224670DD4D77|CONFIRMED|1|72516182.00

@@ -1,357 +1,286 @@
-# On-Premise → AWS Migration — Reference Implementation
+# On-Premise → AWS Migration
 
-Hệ thống đặt hàng B2B chạy trên AWS, dựng hoàn toàn bằng Terraform, kèm một ứng dụng
-demo chạy được thật để có cái mà migrate và mà kiểm thử. Toàn bộ tài liệu bằng tiếng Việt.
+**[🇻🇳 Đọc bản tiếng Việt →](README.vi.md)**
 
-**Bài toán nguồn.** Một doanh nghiệp sản xuất ~150 người dùng đang chạy Web tier,
-Application tier và PostgreSQL trên ba máy vật lý riêng — mỗi tier một instance, backup
-thủ công, không DR, release thủ công. Traffic tăng 4–5 lần vào cao điểm và hệ thống từng sập.
+A three-tier on-premise order system migrated to AWS with zero data loss, built entirely
+in Terraform. Ships with a working application so the failure modes are **measured, not
+claimed**.
 
-**Phạm vi repo.** 11 module Terraform, `apply` 165 tài nguyên và `destroy` 165 tài nguyên
-đều sạch. Ứng dụng demo Python 3.12 + FastAPI. Môi trường local bằng Docker Compose dựng
-đúng topology của bản AWS.
+![Terraform](https://img.shields.io/badge/Terraform-%E2%89%A5_1.9-7B42BC?logo=terraform&logoColor=white)
+![AWS Provider](https://img.shields.io/badge/AWS_Provider-~%3E_6.0-FF9900?logo=amazonwebservices&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![Region](https://img.shields.io/badge/Region-ap--southeast--1-232F3E?logo=amazonaws&logoColor=white)
+
+> **Scope.** This repository is the **infrastructure and migration** work: the Terraform
+> that builds the target platform, and the DMS/DataSync path off the legacy servers. The
+> application is the *workload under test* — it exists so there is something real to
+> migrate, and something real to aim chaos tests at.
+
+---
+
+## Scenario
+
+A manufacturer with ~150 users runs Web, Application and PostgreSQL tiers on three
+separate physical machines: manual backups, no DR, manual releases. Traffic peaks at
+4–5× and the system has gone down under it before.
+
+The migration has to happen **while transactions keep arriving**, with ≤ 15 minutes of
+downtime and no lost or duplicated orders.
+
+The company is fictional. The infrastructure is not — the stack was applied and
+destroyed on a real AWS account on 2026-09-11:
+`Apply complete! Resources: 165 added` → `Destroy complete! Resources: 165 destroyed`,
+nothing orphaned.
 
 | | |
 |---|---|
-| Region | `ap-southeast-1` |
-| Name prefix | `abc-migration-dev` |
-| Compute | EC2 `t4g.small` (Graviton), ASG 2–6, warm pool 2 |
-| Database | RDS PostgreSQL 16.10 `db.t4g.micro`, Multi-AZ, qua RDS Proxy |
-| Hàng đợi | SQS FIFO + DLQ |
-| Chống đơn trùng | DynamoDB accept store |
-| Web tier | CloudFront + S3 (SPA tĩnh) — không phải EC2 |
-| File share | EFS, access point theo phòng ban |
-| Migration | DMS `full-load-and-cdc` + DataSync |
+| **Infrastructure** | 11 Terraform modules, 165 resources, `ap-southeast-1` |
+| **Compute** | EC2 `t4g.small` (Graviton), ASG 2–6, warm pool 2 |
+| **Database** | RDS PostgreSQL 16.10 `db.t4g.micro`, Multi-AZ, behind RDS Proxy |
+| **Queue** | SQS FIFO + DLQ · DynamoDB accept store for deduplication |
+| **Web tier** | CloudFront + S3 static SPA — not EC2 |
+| **File share** | EFS with per-department access points |
+| **Migration** | DMS `full-load-and-cdc` + DataSync |
+| **Application** | Python 3.12 + FastAPI (app tier, worker, SPA) |
 
 ---
 
-## Chạy trong 3 lệnh
+## Architecture
 
-```bash
-bash scripts/up.sh          # build, khởi động, seed 5.000 đơn
-bash scripts/test-all.sh    # chạy ma trận test, xuất bằng chứng vào evidence/
-open http://localhost:8080  # giao diện đặt hàng
-```
+![AWS architecture](docs/img/architecture.png)
 
-Yêu cầu: Docker + Docker Compose. Không cần cài Python hay thư viện nào lên máy.
+Source: [`docs/diagrams/architecture.drawio`](docs/diagrams/architecture.drawio) ·
+all six diagrams: [`docs/architecture.md`](docs/architecture.md)
 
-Hạ tầng AWS: xem [`deploy/terraform/README.md`](deploy/terraform/README.md).
-Profile AWS CLI mặc định là `abc-migration`, đổi bằng biến `AWS_PROFILE`.
+### The application contract the platform has to uphold
 
----
-
-## Kiến trúc
-
-![Kiến trúc AWS](docs/img/architecture.png)
-
-Nguồn: [`docs/diagrams/architecture.drawio`](docs/diagrams/architecture.drawio)
-
-Nguyên tắc chi phối toàn bộ thiết kế:
-
-> **API không bao giờ trả "thành công" trước khi database commit.**
+> **The API never reports success before the database has committed.**
 
 ```
 POST /api/orders       →  202 Accepted   { order_id, status: "PENDING" }
-                          ↑ mới chỉ là "đã nhận yêu cầu"
+                          ↑ "request received", nothing more
 
 GET  /api/orders/{id}  →  { status: "CONFIRMED" }
-                          ↑ đây mới là giao dịch thành công
+                          ↑ this is the committed transaction
 ```
 
-Cả chuỗi hành vi chịu lỗi đến từ đúng một quy tắc — *worker chỉ xoá message khỏi hàng
-đợi sau khi transaction commit thành công*.
+The worker deletes a message from the queue only after the transaction commits. That one
+rule is the reason the platform is shaped the way it is — every row below is an
+infrastructure parameter chosen to make it hold:
 
-### Ba quyết định đáng chú ý
-
-| Quyết định | Lý do |
+| Infrastructure decision | Follows from |
 |---|---|
-| Web tier là **SPA tĩnh trên CloudFront + S3**, không phải EC2 | Vẫn tách biệt Web/App theo yêu cầu, tiết kiệm ~47 USD/tháng, bỏ hẳn một tầng phải vá lỗi |
-| **DynamoDB + SQS nằm ngoài RDS** | Nếu accept store dùng chung database với bảng `orders`, thì khi RDS chết cơ chế chống đơn trùng cũng chết theo — đúng lúc cần nó nhất |
-| **RDS Proxy** đứng giữa app và database | `db.t4g.micro` chịu được ~85 kết nối, ASG có thể lên 6 máy. Proxy gộp connection và giữ kết nối xuyên qua failover Multi-AZ |
-| **Warm pool ở trạng thái `Stopped`** | Máy dự phòng sẵn sàng trong 30–40 giây thay vì 2–3 phút, chỉ tốn tiền ổ đĩa (~0,6 USD/tháng) |
+| SQS **FIFO** with `MessageDeduplicationId` = idempotency key, not Standard | A redelivered order must never become a second order |
+| Visibility timeout **180s**, backoff `min(60 × receive_count, 600)` | Retries have to outlast a 3-minute database outage |
+| DLQ at `maxReceiveCount = 5`, 14-day retention, alarm on the first message | A message that failed five times is an operator problem, not a retry problem |
+| DynamoDB accept store **outside** RDS | Deduplication has to survive the database it protects |
+| ALB target group polls `/ready`, not `/health` | An unreachable database must not make the ASG terminate healthy instances |
+| RDS Proxy between app and database | Connections must survive Multi-AZ failover without a restart |
+
+### Decisions worth defending
+
+| Decision | Why |
+|---|---|
+| Web tier is a **static SPA on CloudFront + S3**, not EC2 | Keeps Web/App separation, saves ~$47/month, removes an entire patching surface |
+| **DynamoDB + SQS live outside RDS** | If the accept store shared a database with the `orders` table, deduplication would die exactly when RDS dies — precisely when it is needed |
+| **RDS Proxy** between app and database | `db.t4g.micro` tolerates ~85 connections, the ASG can reach 6 instances. The proxy pools connections and holds them across Multi-AZ failover |
+| **Warm pool in `Stopped` state** | Standby capacity ready in 30–40s instead of 2–3 minutes, at the cost of EBS only (~$0.60/month) |
 
 ---
 
-## Mạng
+## Network
 
-![Mạng VPC](docs/img/network.png)
+![VPC layout](docs/img/network.png)
 
-Nguồn: [`docs/diagrams/network.drawio`](docs/diagrams/network.drawio)
-
-| Tầng | CIDR | Route `0.0.0.0/0` | Chứa gì |
+| Tier | CIDR | Route to `0.0.0.0/0` | Contains |
 |---|---|---|---|
-| `public` · 2 AZ | `10.0.0.0/24`, `10.0.1.0/24` | → Internet Gateway | ALB, NAT Gateway |
-| `private` · 2 AZ | `10.0.10.0/24`, `10.0.11.0/24` | → NAT Gateway | EC2 App tier + Worker |
-| `data` · 2 AZ | `10.0.20.0/24`, `10.0.21.0/24` | **không có** | RDS, RDS Proxy, EFS mount target, DMS, DataSync ENI |
+| `public` · 2 AZ | `10.0.0.0/24`, `10.0.1.0/24` | Internet Gateway | ALB, NAT Gateway |
+| `private` · 2 AZ | `10.0.10.0/24`, `10.0.11.0/24` | NAT Gateway | App tier EC2 + worker |
+| `data` · 2 AZ | `10.0.20.0/24`, `10.0.21.0/24` | **none** | RDS, RDS Proxy, EFS mount targets, DMS, DataSync ENI |
 
-Điều phân biệt tầng `private` với tầng `data` là **route table**, không phải cái tên.
-Tầng `data` chỉ có route `local`; gộp hai tầng lại thì RDS và EFS mount target có đường
-ra internet và mất hẳn tính tách biệt.
+What separates `private` from `data` is the **route table**, not the name. The `data`
+tier has only the `local` route; merging the two would give RDS and the EFS mount
+targets a path to the internet and destroy the isolation.
 
-Chỉ có **một NAT Gateway**, đặt ở AZ `1a`, cả hai private subnet cùng route qua nó. Đây
-là đánh đổi chi phí có chủ ý (~43 USD/tháng cho cái thứ hai): AZ `1a` chết thì private
-`1b` mất đường ra internet, còn lưu lượng *đi vào* qua ALB không bị ảnh hưởng.
+There is **one NAT Gateway**, in AZ `1a`, with both private subnets routing through it —
+a deliberate cost trade-off (~$43/month for the second one). If AZ `1a` fails, private
+`1b` loses egress; *inbound* traffic through the ALB is unaffected.
 
-S3 Gateway Endpoint gắn vào cả bốn route table, nên lưu lượng tới S3 không đi qua NAT.
-`map_public_ip_on_launch = false` trên cả hai public subnet.
+An S3 Gateway Endpoint is attached to all four route tables, so S3 traffic bypasses NAT.
+`map_public_ip_on_launch = false` on both public subnets.
 
----
+### Security groups
 
-## Security group
-
-![Security group](docs/img/security-groups.png)
-
-Nguồn: [`docs/diagrams/security-groups.drawio`](docs/diagrams/security-groups.drawio)
-
-| Security group | Ingress | Từ đâu |
+| Security group | Ingress | Source |
 |---|---|---|
 | `sg-alb-public` | `tcp/80`, `tcp/443` | `0.0.0.0/0` |
 | `sg-app` | `tcp/8080` | `sg-alb-public` |
 | `sg-rds-proxy` | `tcp/5432` | `sg-app` |
-| `sg-rds` | `tcp/5432` | `sg-rds-proxy` **và** `sg-app` (đường dự phòng khi proxy lỗi) |
+| `sg-rds` | `tcp/5432` | `sg-rds-proxy` **and** `sg-app` (fallback if the proxy fails) |
 | `sg-fileserver` | `tcp/2049` | `sg-app`, `sg-admin-client` |
-| `sg-admin-client` | — | không có ingress; tồn tại chỉ để được tham chiếu làm nguồn |
+| `sg-admin-client` | — | no ingress; exists only to be referenced as a source |
 
-Chỉ `sg-alb-public` mở theo dải CIDR. Mọi rule còn lại dùng
-`referenced_security_group_id`, nên thêm hay thay instance không phải sửa rule và không
-có IP nào bị hard-code.
-
-Cả sáu security group đều egress `all → 0.0.0.0/0`. Việc chặn chiều ra dựa vào route
-table, không dựa vào security group.
+Only `sg-alb-public` opens by CIDR. Every other rule uses
+`referenced_security_group_id`, so adding or replacing instances never means editing
+rules and no IP is hard-coded. Egress is `all → 0.0.0.0/0` on all six — outbound control
+is enforced by route tables, not security groups.
+[Diagram →](docs/img/security-groups.png)
 
 ---
 
-## Vòng đời một đơn hàng
+## Behaviour under failure
 
-![Luồng một đơn hàng](docs/img/request-flow.png)
+![Order lifecycle](docs/img/request-flow.png)
 
-Nguồn: [`docs/diagrams/request-flow.drawio`](docs/diagrams/request-flow.drawio)
+When RDS becomes unreachable:
 
-Hệ quả khi RDS mất kết nối:
-
-- `COMMIT` không thành công → worker **không** gọi `DeleteMessage` → message ở lại hàng
-  đợi → đơn vẫn `PENDING`. Không ai nhận được báo thành công sai.
-- Hết visibility timeout 180s, SQS giao lại message. Backoff giãn dần
-  `min(60 × receive_count, 600)` — tổng khoảng 10 phút.
-- RDS sống lại → chính worker đó (không ai restart) tự drain hàng đợi. Message giao lại
-  gặp `ON CONFLICT DO NOTHING` nên không tạo đơn trùng.
-- Quá `maxReceiveCount = 5` → message rơi vào `orders-dlq.fifo`, giữ 14 ngày, alarm
-  `dlq-not-empty` kêu ngay ở lần đầu tiên.
+- `COMMIT` fails → the worker does **not** call `DeleteMessage` → the message stays
+  queued → the order stays `PENDING`. Nobody receives a false success.
+- After the 180s visibility timeout SQS redelivers. Backoff grows as
+  `min(60 × receive_count, 600)` — roughly 10 minutes total.
+- RDS returns → the same worker (no restart) drains the queue. Redelivered messages hit
+  `ON CONFLICT DO NOTHING`, so no duplicate orders.
+- Past `maxReceiveCount = 5` the message lands in `orders-dlq.fifo`, retained 14 days,
+  and the `dlq-not-empty` alarm fires on the first occurrence.
 
 ---
 
 ## Migration
 
-![Hai luồng migration](docs/img/migration.png)
-
-Nguồn: [`docs/diagrams/migration.drawio`](docs/diagrams/migration.drawio)
-
-| Nguồn | Công cụ | Đích |
+| Source | Tool | Target |
 |---|---|---|
-| PostgreSQL on-premise | **DMS** `full-load-and-cdc`, replication instance trong data subnet, `publicly_accessible = false` | RDS PostgreSQL primary |
-| File server on-premise | Đẩy lên **S3 staging** rồi **DataSync** đồng bộ | EFS file system |
+| On-premise PostgreSQL | **DMS** `full-load-and-cdc`, replication instance in the data subnet, `publicly_accessible = false` | RDS PostgreSQL primary |
+| On-premise file server | Upload to **S3 staging**, then **DataSync** | EFS file system |
 
-Terraform dựng sẵn replication instance, hai endpoint và task, nhưng
-`start_replication_task = false` — task **không** tự chạy, người vận hành bấm tay.
+Terraform provisions the replication instance, both endpoints and the task, but sets
+`start_replication_task = false` — the task does **not** start itself, an operator
+triggers it. The S3 staging bucket is deliberately outside this stack: passed in as
+`migration_files_bucket_arn`, read access granted through `datasync_role_arn`.
 
-S3 staging **không** thuộc Terraform stack này: truyền vào bằng biến
-`migration_files_bucket_arn`, quyền đọc cấp qua `datasync_role_arn`.
-
----
-
-## Giám sát và truy vết
-
-![Giám sát](docs/img/observability.png)
-
-Nguồn: [`docs/diagrams/observability.drawio`](docs/diagrams/observability.drawio)
-
-Log ứng dụng là JSON, mang `correlation_id` xuyên tier. App tier sinh id ngay khi nhận
-request, gắn vào message SQS, worker log lại cùng id đó, và bảng `order_events` lưu id
-vào từng bản ghi. Một truy vấn Logs Insights dựng lại được toàn bộ đường đi của đơn hàng.
-
-`alarm_actions` và `ok_actions` đều trỏ vào cùng một SNS topic, nên khi sự cố kết thúc
-cũng có thông báo.
+[Diagram →](docs/img/migration.png) ·
+[Runbooks → (VI)](docs/ban-giao/migration/)
 
 ---
 
-## Thông số kỹ thuật
+## Observability
 
-<details>
-<summary><b>Compute — <code>modules/compute</code></b></summary>
+Application logs are JSON carrying a `correlation_id` across tiers. The app tier mints
+the id on request, attaches it to the SQS message, the worker logs under the same id,
+and the `order_events` table stores it per row — one Logs Insights query reconstructs an
+order's entire path.
 
-| Tham số | Giá trị |
-|---|---|
-| AMI | Amazon Linux 2023, kernel mặc định, `arm64` (lấy từ SSM public parameter) |
-| Instance type | `t4g.small` |
-| ASG | `min 2` / `desired 2` / `max 6`, `availability_zone_distribution = balanced-best-effort` |
-| Warm pool | `Stopped`, `min_size = 2`, `reuse_on_scale_in = true` |
-| Scaling policy | Target tracking `ALBRequestCountPerTarget = 600` req/phút mỗi instance |
-| Health check | `ELB`, grace 120s, `default_instance_warmup = 90s` |
-| Instance refresh | Rolling, `min_healthy_percentage = 50`, warmup 120s |
-| IMDS | `http_tokens = required`, `http_put_response_hop_limit = 1` (bắt buộc IMDSv2) |
-| Root volume | 20 GiB `gp3`, mã hoá, `delete_on_termination` |
-| ALB | internet-facing, `idle_timeout = 60`, `drop_invalid_header_fields = true`, access log vào S3 |
-| Target group | `:8080`, health check `/ready` mỗi 10s, timeout 5s, ngưỡng 2/2, dereg delay 30s |
-
-</details>
-
-<details>
-<summary><b>Database — <code>modules/data</code></b></summary>
-
-| Tham số | Giá trị |
-|---|---|
-| Engine | PostgreSQL `16.10`, `db.t4g.micro` |
-| Multi-AZ | bật · `publicly_accessible = false` |
-| Storage | `gp3` 20 GiB, autoscale tới 100 GiB, `storage_encrypted = true` |
-| Backup | giữ 7 ngày, cửa sổ `17:00–18:00`, `delete_automated_backups = false` |
-| Maintenance | `sun:18:30–sun:19:30`, `auto_minor_version_upgrade = false` |
-| Bảo vệ | `deletion_protection = !allow_destroy`, final snapshot khi không bật `allow_destroy` |
-| Parameter group | `rds.force_ssl = 1`, `rds.logical_replication = 1`, `log_min_duration_statement = 500`, `log_lock_waits = 1`, `idle_in_transaction_session_timeout = 60000` |
-| Log export | `postgresql`, `upgrade` · Performance Insights bật |
-| RDS Proxy | `require_tls = true`, `idle_client_timeout = 1800`, pool `max_connections_percent = 90`, `max_idle = 50`, `connection_borrow_timeout = 120` |
-| Credential | `random_password` 32 ký tự → Secrets Manager (proxy dùng) + SSM Parameter Store (`SecureString`) |
-
-</details>
-
-<details>
-<summary><b>Hàng đợi — <code>modules/queue</code></b></summary>
-
-| Tham số | Giá trị |
-|---|---|
-| Queue | `abc-migration-dev-orders.fifo` |
-| FIFO | `deduplication_scope = messageGroup`, `fifo_throughput_limit = perMessageGroupId` |
-| Dedup | `content_based_deduplication = false` — client đặt `MessageDeduplicationId` = `Idempotency-Key` |
-| Visibility timeout | 180s · `receive_wait_time_seconds = 20` (long poll) |
-| Max message size | 262.144 byte · `delay_seconds = 0` |
-| Redrive | `maxReceiveCount = 5` → `abc-migration-dev-orders-dlq.fifo` |
-| DLQ | giữ 14 ngày, `redrive_allow_policy` chỉ nhận từ queue chính |
-| Mã hoá | `sqs_managed_sse_enabled` trên cả hai |
-
-</details>
-
-<details>
-<summary><b>CDN và tài nguyên tĩnh — <code>modules/cdn</code>, <code>modules/static</code></b></summary>
-
-| Tham số | Giá trị |
-|---|---|
-| Origin | 2 cái — S3 assets (qua OAC, SigV4) và ALB (custom origin) |
-| Protocol | `http2and3`, viewer `redirect-to-https`, `PriceClass_200` |
-| Behavior mặc định | → S3 · `CachingOptimized` + `CORS-S3Origin` + `SecurityHeadersPolicy` |
-| Behavior `/api/*` | → ALB · `CachingDisabled` + `AllViewerExceptHostHeader`, đủ 7 method |
-| SPA routing | `403` và `404` → `200` + `/index.html`, `error_caching_min_ttl = 10` |
-| Bucket assets | block public access toàn phần, `BucketOwnerEnforced`, versioning, chỉ CloudFront đọc được qua policy có điều kiện `AWS:SourceArn` |
-
-</details>
-
-<details>
-<summary><b>File share — <code>modules/fileserver</code></b></summary>
-
-| Tham số | Giá trị |
-|---|---|
-| EFS | `generalPurpose`, `throughput_mode = elastic`, mã hoá |
-| Lifecycle | chuyển IA sau 30 ngày, quay lại Standard sau 1 lần truy cập |
-| Mount target | mỗi AZ một cái, dùng `sg-fileserver` |
-| Access point phòng ban | uid/gid riêng, root `/<phòng ban>`, quyền `0770` |
-| Access point chung | `/public`, uid 6000, gid 5000, `secondary_gids` = tất cả phòng ban, quyền `0775` |
-| File system policy | `Deny` mọi thao tác khi `aws:SecureTransport = false`; chỉ `Allow` mount qua đúng danh sách access point |
-| Backup | `aws_efs_backup_policy` bật |
-
-</details>
+8 CloudWatch alarms, 4 saved Logs Insights queries, a dashboard, SNS notifications.
+`alarm_actions` and `ok_actions` point at the same topic, so recovery is announced too.
+[Diagram →](docs/img/observability.png)
 
 ---
 
-## Ràng buộc đề bài → cách hiện thực
+## Measured results
 
-| # | Ràng buộc | Cách hiện thực |
+The system is tested against 10 explicit requirements. Numbers below are observed, not
+estimated.
+
+### Platform and migration
+
+| Scenario | Req | Where | Result |
+|---|---|---|---|
+| `terraform apply` then `destroy` | #8 | AWS | 165 added, 165 destroyed, nothing orphaned |
+| Kill an app instance mid-traffic | #4 | AWS | **Pass** — 44s gap against a 120s budget |
+| Cut database connectivity for 90s | #5 | AWS | **Pass** — 0 false successes, `/health` recovered in 11s |
+| RDS Multi-AZ failover | #5 | AWS | **Pass** — 13–20s gap, app and worker `NRestarts=0` |
+| Point-in-time recovery of deleted orders | #6 | AWS | **Pass** — RTO 12m49s, RPO 5–7min, 50/50 orders |
+| Revoke file-server permissions | #7 | AWS | **Fail, as designed** — see below |
+| Cutover under live transactions | #2 | local | 1.1s service interruption, 3,587 orders reconciled, totals exact |
+| Per-department file permission matrix | #7 | local | 30/30 |
+
+### Application behaviour on top of it
+
+| Scenario | Req | Where | Result |
+|---|---|---|---|
+| Same idempotency key sent 5× | #3 | AWS | **Pass** — exactly 1 `order_id` |
+| 10 concurrent updates to one order | #3 | AWS | **Pass** — one `200`, nine `409` |
+| Parallel reporting under transaction load | #10 | local | 5 jobs, identical checksum, order-create p95 61ms |
+| Full test matrix (`scripts/test-all.sh`) | — | local | 21/21 pass |
+
+Local p95 figures are small because the dataset is only 12,000 orders — they demonstrate
+**correct behaviour**, not capacity.
+
+<details>
+<summary><b>The 10 requirements</b></summary>
+
+| # | Requirement | Implementation |
 |---|---|---|
-| 1 | Chạy độc lập sau khi ngắt nguồn on-premise | Không còn phụ thuộc ngược |
-| 2 | Migration khi vẫn phát sinh giao dịch, downtime ≤ 15 phút | DMS `full-load-and-cdc`, sổ cái đơn hàng đối chiếu trước/sau cutover |
-| 3 | Không tạo đơn trùng | Accept store DynamoDB (`ConditionExpression`) + `UNIQUE(idempotency_key)` |
-| 3 | Không âm thầm ghi đè | Cột `version`, `UPDATE ... WHERE version = $expected` → `409` |
-| 4 | Chịu tải 5x, p95 ≤ 2s, gián đoạn ≤ 2 phút | Tách tier, hàng đợi hấp thụ spike ghi, ASG + warm pool |
-| 5 | DB chết 3 phút, tự hồi phục, không báo thành công giả | API trả `202`; worker chỉ xoá message sau khi commit |
-| 6 | RPO ≤ 5 phút, RTO ≤ 30 phút | RDS PITR ra instance tạm rồi chèn ngược |
-| 7 | File server giữ quyền theo phòng ban, thu hồi ≤ 5 phút | EFS access point + manifest checksum |
-| 8 | Truy vết giao dịch, dựng lại được môi trường | `correlation_id` xuyên tier, bảng `order_events`, toàn bộ hạ tầng là Terraform |
-| 9 | Kiểm soát chi phí, chịu được cắt 20% ngân sách | Hai bản sizing, đòn bẩy theo lịch chạy |
-| 10 | Báo cáo song song không làm chậm OLTP | `REPEATABLE READ` trên replica, mốc chốt tường minh |
+| 1 | Runs independently once on-premise is powered off | No reverse dependencies remain |
+| 2 | Migrate under live transactions, downtime ≤ 15 min | DMS `full-load-and-cdc`, order ledger reconciled before/after cutover |
+| 3 | No duplicate orders | DynamoDB accept store (`ConditionExpression`) + `UNIQUE(idempotency_key)` |
+| 3 | No silent overwrites | `version` column, `UPDATE ... WHERE version = $expected` → `409` |
+| 4 | Survive 5× load, p95 ≤ 2s, interruption ≤ 2 min | Tier separation, queue absorbs write spikes, ASG + warm pool |
+| 5 | DB down 3 min, self-healing, no false success | API returns `202`; worker deletes the message only after commit |
+| 6 | RPO ≤ 5 min, RTO ≤ 30 min | RDS PITR into a temporary instance, then reinsert |
+| 7 | Per-department file permissions, revocation ≤ 5 min | EFS access points + manifest checksum |
+| 8 | Transaction traceability, reproducible environment | `correlation_id` across tiers, `order_events` table, all infra in Terraform |
+| 9 | Cost control, absorb a 20% budget cut | Two sizing profiles, scheduled-shutdown levers |
+| 10 | Parallel reporting must not slow OLTP | `REPEATABLE READ` on the replica, explicit cutoff |
+
+Full mapping: [`docs/ban-giao/anh-xa-rang-buoc.md` (VI)](docs/ban-giao/anh-xa-rang-buoc.md)
+
+</details>
 
 ---
 
-## Kết quả đo được
+## Two designs that measurement proved wrong
 
-### Trên AWS thật
+**EFS does not re-evaluate access points on each I/O operation.** The first version of
+the design document stated "delete the access point → the open mount loses access on its
+next operation" — reasoned, not measured. Measured, an already-open mount kept reading
+and writing for **283 seconds**, well past requirement #7's 5-minute bound. The procedure
+became two steps: delete the access point (blocking new mounts) **and** force `umount -f`
+via SSM Run Command.
 
-| Kịch bản | Ràng buộc | Kết quả |
-|---|---|---|
-| Gửi lại cùng mã đơn 5 lần | #3 | Đạt — đúng 1 `order_id` |
-| 10 request đồng thời sửa 1 đơn | #3 | Đạt — 1 lần `200`, 9 lần `409` |
-| Thu hồi quyền file server | #7 | **Không đạt bằng cách đã thiết kế** — xem phần dưới |
-| Giết 1 instance App tier khi đang phục vụ | #4 | Đạt — gián đoạn 44 giây / ngân sách 120 giây |
-| Cắt kết nối database 90 giây | #5 | Đạt vế chính — 0 đơn báo thành công sai, `/health` hồi sau 11 giây |
-| Failover RDS Multi-AZ | #5 | Đạt — gián đoạn 13–20 giây, app và worker `NRestarts=0` |
-| Khôi phục đơn bị xoá nhầm (PITR) | #6 | Đạt — RTO 12 phút 49 giây, RPO 5–7 phút, 50/50 đơn |
+**Backoff shorter than the outage makes retries pointless.**
+`release(msg, delay_seconds=5)` with `maxReceiveCount = 5` allows ~25 seconds of total
+retry, while requirement #5 demands surviving a 3-minute outage — so 1 in 5 orders landed
+in the DLQ. Replaced with `min(60 × receive_count, 600)`, roughly 10 minutes.
 
-### Ở local
+## Known gaps
 
-| Kịch bản | Ràng buộc | Kết quả |
-|---|---|---|
-| Cutover khi vẫn có giao dịch | #2 | Ngừng dịch vụ 1,1 giây, 3.587 đơn khớp, tổng tiền khớp tuyệt đối |
-| Phân quyền file server | #7 | 30/30 phép thử |
-| Báo cáo song song + tải giao dịch | #10 | 5 job cùng checksum, p95 tạo đơn 61 ms |
+- **30-minute 5× load test (#4)** — needs a dedicated k6 EC2 generator; running it from a
+  laptop over the internet measures the link, not the system.
+- **With/without RDS Proxy comparison** — current numbers are *with* proxy only.
+- **Outage test re-run after the backoff fix** — the fix is committed, the infrastructure
+  has not been rebuilt to re-measure.
+- **Requirement #1** is satisfied by design only — on-premise has not actually been cut off.
 
-Các con số p95 ở local nhỏ vì dataset chỉ 12.000 đơn — chúng chứng minh **hành vi đúng**,
-chưa phải năng lực chịu tải thật.
-
----
-
-## Hai chỗ thiết kế ban đầu sai
-
-**EFS không xét lại access point ở từng thao tác I/O.** Tài liệu đầu tiên viết "xoá
-access point → mount đang mở mất quyền ở thao tác tiếp theo" — viết theo suy luận, không
-đo. Đo thật thì mount đang mở vẫn đọc ghi bình thường suốt **283 giây**, vượt xa mốc 5
-phút của ràng buộc #7. Quy trình phải đổi thành hai bước: xoá access point (chặn mount
-mới) **và** ép `umount -f` qua SSM Run Command.
-
-**Backoff ngắn hơn thời gian sự cố thì retry vô nghĩa.** `release(msg, delay_seconds=5)`
-với `maxReceiveCount = 5` chỉ cho tổng ~25 giây thử lại, trong khi ràng buộc #5 yêu cầu
-chịu được 3 phút mất kết nối — nên 1/5 đơn rơi vào DLQ. Sửa thành giãn dần
-`min(60 × receive_count, 600)`, tổng khoảng 10 phút.
+Infrastructure for all three is already in Terraform; what remains is running them.
 
 ---
 
-## Còn thiếu
+## Run it
 
-- **Test tải 5x trong 30 phút (#4)** — cần một EC2 riêng làm máy phát tải k6; chạy từ
-  laptop qua internet thì p95 đo được là độ trễ đường truyền.
-- **So sánh có/không RDS Proxy** — số hiện tại chỉ là số *có* proxy.
-- **Chạy lại test outage sau khi sửa backoff** — bản sửa đã commit, chưa dựng lại hạ
-  tầng để đo.
-- **Ràng buộc #1** mới đạt về thiết kế — chưa cắt nguồn on-premise thật.
+### Locally — three commands
 
-Hạ tầng cho cả ba bài đầu đã có sẵn trong Terraform, chỉ còn bước chạy và bấm giờ.
+```bash
+bash scripts/up.sh          # build, start, seed 5,000 orders
+bash scripts/test-all.sh    # run the test matrix, write evidence/
+open http://localhost:8080  # order UI
+```
 
----
+Requires Docker and Docker Compose. Nothing is installed on the host.
 
-## Ánh xạ local ↔ AWS
+```bash
+WITH_ONPREM=1 bash scripts/up.sh      # also start the source system, for cutover rehearsal
+FULL=1 bash scripts/test-all.sh       # outage test runs the full 180s
+PROFILE=full bash scripts/loadtest.sh # k6: 50 → 250 req/s over 30 minutes
+bash scripts/down.sh --volumes        # tear down and wipe data
+```
 
-Môi trường local dựng đúng hình dạng của bản AWS, để những gì test được ở đây vẫn còn ý
-nghĩa khi lên cloud.
+The local topology mirrors AWS deliberately: `web` → CloudFront + S3, `app` → ASG behind
+the ALB, `worker` → separate process on the same ASG, `db`/`db-replica` → RDS Multi-AZ +
+read replica, and `queue-db` → SQS + DynamoDB. The queue **must** be a separate container
+— on AWS, SQS and DynamoDB are independent of RDS, so co-locating them would make the
+database-outage test meaningless.
 
-| Container local | Tương ứng trên AWS |
-|---|---|
-| `web` | **CloudFront + S3** — không phải EC2. Trang là SPA tĩnh, `/api/*` đi thẳng xuống ALB |
-| `app` | ASG App tier, private subnet, sau ALB public |
-| `worker` | Process riêng trên cùng ASG |
-| `db` | RDS PostgreSQL Multi-AZ, truy cập qua RDS Proxy |
-| `db-replica` | RDS read replica — chỉ phục vụ job báo cáo |
-| `queue-db` | SQS FIFO (`orders.fifo`) + DynamoDB accept store |
-
-`queue-db` **phải** là container riêng: trên AWS, SQS và DynamoDB độc lập hoàn toàn với
-RDS. Nếu ở local để hàng đợi nằm chung database với bảng `orders` thì khi chặn RDS để
-test outage, hàng đợi cũng chết theo và kịch bản mất hết ý nghĩa.
-
-Chuyển sang dịch vụ AWS thật chỉ là đổi biến môi trường, không đổi code:
+Switching to the real AWS services is environment variables only, no code change:
 
 ```bash
 QUEUE_DRIVER=sqs              SQS_QUEUE_URL=https://sqs.ap-southeast-1.../orders.fifo
@@ -359,81 +288,69 @@ ACCEPT_STORE_DRIVER=dynamodb  DDB_ACCEPT_TABLE=abc-order-accept
 DB_HOST=abc-rds-proxy.proxy-xxxx.ap-southeast-1.rds.amazonaws.com
 ```
 
+### On AWS
+
+```bash
+cd deploy/terraform
+cp terraform.tfvars.example terraform.tfvars   # set expected_account_id, alarm_email, ...
+terraform init
+terraform plan
+terraform apply
+```
+
+Terraform refuses to touch anything if the resolved profile is not
+`expected_account_id`. Feature flags: `create_cloudfront`, `create_rds_proxy`,
+`create_migration`, `create_dms_service_roles`, `allow_destroy`.
+Full guide: [`deploy/terraform/README.md` (VI)](deploy/terraform/README.md)
+
 ---
 
-## Module Terraform
+## Layout
 
-| Module | Nội dung chính |
+```
+app/                  App tier, worker, SPA — Python 3.12 + FastAPI
+db/                   PostgreSQL schema + data generator
+deploy/local/         Docker Compose mirroring the AWS topology
+deploy/terraform/     11 modules, each with its own README
+docs/diagrams/        .drawio sources (official AWS Architecture Icons)
+docs/ban-giao/        Technical docs, runbook, rollout plan, costs (Vietnamese)
+scripts/              Per-requirement test scripts, load generation, file-share setup
+loadtest/k6/          k6 load scenarios
+```
+
+| Module | Contents |
 |---|---|
-| `network` | VPC, 6 subnet, IGW, 1 NAT, 4 route table, S3 gateway endpoint |
-| `security` | 6 security group, rule tham chiếu lẫn nhau |
+| `network` | VPC, 6 subnets, IGW, 1 NAT, 4 route tables, S3 gateway endpoint |
+| `security` | 6 security groups, mutually referenced rules |
 | `iam` | Instance role (SSM Session Manager, CloudWatch agent, S3 artifacts), proxy role |
-| `data` | RDS Multi-AZ, parameter group, RDS Proxy, Secrets Manager, 5 SSM parameter |
+| `data` | RDS Multi-AZ, parameter group, RDS Proxy, Secrets Manager, 5 SSM parameters |
 | `queue` | SQS FIFO, DLQ, redrive policy, DynamoDB accept table |
-| `compute` | ALB, target group, launch template, ASG, warm pool, 2 S3 bucket, log group |
-| `static` | S3 assets bucket, upload bản build với đúng content type |
-| `cdn` | CloudFront 2 origin, OAC, cache policy, custom error response |
-| `fileserver` | EFS, mount target, access point, file system policy, backup policy |
-| `observability` | 8 alarm, SNS, metric filter, dashboard, 4 Logs Insights query |
-| `migration` | DMS replication instance + endpoint + task, DataSync location + task |
+| `compute` | ALB, target group, launch template, ASG, warm pool, 2 S3 buckets, log group |
+| `static` | S3 assets bucket, SPA build upload with correct content types |
+| `cdn` | CloudFront with 2 origins, OAC, cache policies, custom error responses |
+| `fileserver` | EFS, mount targets, access points, file system policy, backup policy |
+| `observability` | 8 alarms, SNS, metric filter, dashboard, 4 Logs Insights queries |
+| `migration` | DMS replication instance + endpoints + task, DataSync locations + task |
 
-Mỗi module có README riêng. Luồng đi xuyên hạ tầng: [`deploy/terraform/FLOW.md`](deploy/terraform/FLOW.md).
-
-Biến cờ đáng chú ý: `create_cloudfront`, `create_rds_proxy`, `create_migration`,
-`create_dms_service_roles`, `allow_destroy`. Terraform dừng trước khi động vào bất cứ thứ
-gì nếu profile phân giải ra account khác `expected_account_id`.
+Cross-cutting flows — order creation, database failure, instance loss, scale-out,
+release, parallel reporting, tracing, module dependency order:
+[`deploy/terraform/FLOW.md` (VI)](deploy/terraform/FLOW.md)
 
 ---
 
-## Cấu trúc
+## Documentation
 
-| Thư mục | Nội dung |
+Deep documentation is in Vietnamese, under [`docs/ban-giao/`](docs/ban-giao/).
+
+| Document | Contents |
 |---|---|
-| `app/` | Ứng dụng demo — App tier, Worker, Web tier (Python 3.12 + FastAPI) |
-| `db/` | Schema PostgreSQL + trình sinh dữ liệu |
-| `deploy/local/` | Docker Compose dựng topology giống AWS ở máy local |
-| `deploy/terraform/` | 11 module, mỗi module có README riêng |
-| `docs/diagrams/` | Nguồn `.drawio` của 6 sơ đồ |
-| `docs/img/` | PNG xuất ra, dùng trong README |
-| `docs/ban-giao/` | Tài liệu kỹ thuật, runbook, kế hoạch triển khai, chi phí |
-| `scripts/` | Script test từng ràng buộc, sinh tải, dựng file share |
-| `loadtest/k6/` | Kịch bản k6 cho test chịu tải |
-
-Bắt đầu từ [`docs/ban-giao/tai-lieu-ky-thuat.md`](docs/ban-giao/tai-lieu-ky-thuat.md) —
-bản ngắn, viết cho người không cần biết AWS.
-
----
-
-## Các lệnh hay dùng
-
-```bash
-# Môi trường
-bash scripts/up.sh                       # dựng + seed
-WITH_ONPREM=1 bash scripts/up.sh         # dựng thêm hệ thống nguồn để diễn tập cutover
-bash scripts/reset.sh                    # xoá dữ liệu, seed lại
-bash scripts/down.sh --volumes           # dọn sạch
-
-# Test
-bash scripts/test-all.sh                 # bộ nhanh (~4 phút)
-FULL=1 bash scripts/test-all.sh          # test outage chạy đủ 180 giây
-bash scripts/test-a2-idempotency.sh      # từng test riêng lẻ
-
-# Chịu tải — k6 chạy trong Docker
-bash scripts/loadtest.sh                     # smoke ~2,5 phút
-PROFILE=full bash scripts/loadtest.sh        # 50 → 250 req/s trong 30 phút
-```
-
----
-
-## Sinh lại sơ đồ
-
-File `.drawio` trong `docs/diagrams/` là nguồn duy nhất. Xuất PNG bằng draw.io Desktop:
-
-```bash
-for f in architecture network security-groups request-flow migration observability; do
-  drawio -x -f png -b 24 --width 1900 -o "docs/img/$f.png" "docs/diagrams/$f.drawio"
-done
-```
-
-Sơ đồ dùng bộ **AWS Architecture Icons** chính thức (thư viện `mxgraph.aws4`). Mở và sửa
-bằng [app.diagrams.net](https://app.diagrams.net) hoặc draw.io Desktop.
+| [tai-lieu-ky-thuat.md](docs/ban-giao/tai-lieu-ky-thuat.md) | Technical overview, written for a reader who does not know AWS — **start here** |
+| [lua-chon-thiet-ke.md](docs/ban-giao/lua-chon-thiet-ke.md) | Service choices: what was picked, against what, why, and when to pick the opposite |
+| [thong-so-ky-thuat.md](docs/ban-giao/thong-so-ky-thuat.md) | Full parameter reference for every service |
+| [runbook.md](docs/ban-giao/runbook.md) | Operational runbook |
+| [anh-xa-rang-buoc.md](docs/ban-giao/anh-xa-rang-buoc.md) | Requirement → mechanism → proof |
+| [ke-hoach-trien-khai.md](docs/ban-giao/ke-hoach-trien-khai.md) | Rollout plan |
+| [chi-phi.md](docs/ban-giao/chi-phi.md) | Cost model: customer quote and demo environment |
+| [quy-trinh-release.md](docs/ban-giao/quy-trinh-release.md) | Release process |
+| [huong-dan-console.md](docs/ban-giao/huong-dan-console.md) | Console walkthrough, in deployment order |
+| [scripts/SAFETY.md](scripts/SAFETY.md) | Rules for permission-probing scripts, written after one destroyed live resources |
